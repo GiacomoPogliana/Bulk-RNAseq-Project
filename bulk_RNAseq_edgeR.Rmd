@@ -1,0 +1,621 @@
+---
+title: "Bulk RNA-seq – Differential Expression Analysis with edgeR"
+subtitle: "Brain · Blood · Muscle (GTEx / recount3)"
+author: "Giacomo Pogliana"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    fig_width: 9
+    fig_height: 5
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo      = TRUE,
+  warning   = FALSE,
+  message   = FALSE,
+  fig.align = "center"
+)
+```
+
+------------------------------------------------------------------------
+
+# 1 · Libraries and data loading
+
+Three tissue datasets are retrieved from the **GTEx** project via the
+**recount3** interface: frontal cortex (Brain), whole blood (Blood), and
+skeletal muscle (Muscle). Each dataset is stored as a
+`RangedSummarizedExperiment` (RSE) object.
+
+Raw recount3 data stores per-base coverage rather than read counts.
+`transform_counts()` converts coverage to integer counts by scaling each
+base-level value by the average read length, making the data suitable for
+count-based statistical models such as edgeR.
+
+```{r libraries-data}
+library(recount3)
+library(recount)
+library(edgeR)
+
+rse_brain  <- readRDS("rse_brain.RDS")
+rse_blood  <- readRDS("rse_blood.RDS")
+rse_muscle <- readRDS("rse_muscle.RDS")
+
+# Convert coverage → counts
+assays(rse_brain)$counts  <- transform_counts(rse_brain)
+assays(rse_blood)$counts  <- transform_counts(rse_blood)
+assays(rse_muscle)$counts <- transform_counts(rse_muscle)
+```
+
+------------------------------------------------------------------------
+
+# 2 · Sample quality control
+
+Before selecting samples for downstream analysis, three QC metrics are
+inspected for each tissue:
+
+- **RIN (RNA Integrity Number) ≥ 6** — a low RIN indicates RNA
+  degradation, which introduces systematic biases in library preparation
+  and reduces the reliability of expression estimates.
+- **Uniquely mapped reads ≥ 80%** — a low mapping rate may reflect
+  contamination, poor library quality, or a mismatch between the sample
+  and the reference genome.
+- **rRNA fraction < 10%** — high ribosomal RNA carry-over suggests
+  incomplete ribo-depletion, which dilutes the mRNA signal and inflates
+  library size without adding informative reads.
+
+These thresholds follow GTEx consortium recommendations and standard
+bulk RNA-seq best practices.
+
+## Brain
+
+```{r qc-brain}
+# RIN
+colData(rse_brain)$gtex.smrin[72:75]
+
+# % mapped
+colData(rse_brain)$"recount_qc.star.uniquely_mapped_reads_%_both"[72:75]
+
+# % rRNA
+colData(rse_brain)$gtex.smrrnart[72:75]
+```
+
+## Blood
+
+```{r qc-blood}
+colData(rse_blood)$gtex.smrin[72:74]
+colData(rse_blood)$"recount_qc.star.uniquely_mapped_reads_%_both"[72:74]
+colData(rse_blood)$gtex.smrrnart[72:74]
+```
+
+## Muscle
+
+```{r qc-muscle}
+colData(rse_muscle)$gtex.smrin[72:75]
+colData(rse_muscle)$"recount_qc.star.uniquely_mapped_reads_%_both"[72:75]
+colData(rse_muscle)$gtex.smrrnart[72:75]
+```
+
+------------------------------------------------------------------------
+
+# 3 · Sample selection and count matrix
+
+Three samples per tissue that pass all QC thresholds are retained,
+giving a balanced design of **9 samples** (3 per group). The count
+matrices are concatenated column-wise into a single matrix `x`, and
+column/row names are assigned for readability.
+
+Using three samples per group is a deliberate trade-off: it satisfies
+the minimum required for variance estimation in edgeR while keeping the
+design balanced — a critical requirement for the contrast-based
+comparisons performed later.
+
+```{r count-table}
+rse_brain_selected  <- rse_brain[,  c(73, 74, 75)]
+rse_blood_selected  <- rse_blood[,  c(72, 73, 74)]
+rse_muscle_selected <- rse_muscle[, c(72, 73, 75)]
+
+counts_brain_selected  <- assays(rse_brain_selected)$counts
+counts_blood_selected  <- assays(rse_blood_selected)$counts
+counts_muscle_selected <- assays(rse_muscle_selected)$counts
+
+x <- cbind(counts_brain_selected, counts_blood_selected, counts_muscle_selected)
+
+colnames(x) <- c("Brain73",  "Brain74",  "Brain75",
+                 "Blood72",  "Blood73",  "Blood74",
+                 "Muscle72", "Muscle73", "Muscle75")
+
+rownames(x) <- rowData(rse_brain_selected)$gene_name
+```
+
+------------------------------------------------------------------------
+
+# 4 · DGEList object
+
+The count matrix is wrapped into a `DGEList` object, which is edgeR's
+core data structure. It bundles counts, library sizes, and sample-level
+metadata in one place, simplifying downstream function calls.
+
+Alongside the tissue group label, additional QC covariates (RIN, tissue
+sub-region, sex, age, rRNA fraction, mapping rate, mitochondrial read
+fraction) are stored in `y$samples`. These are not included in the
+statistical model, but are used in the MDS plots (Section 8) to
+visually assess whether any of them drive unwanted variance.
+
+```{r dgelist}
+y <- DGEList(counts = x)
+
+group <- as.factor(c("Brain", "Brain", "Brain",
+                     "Blood", "Blood", "Blood",
+                     "Muscle", "Muscle", "Muscle"))
+
+y$samples$group <- group
+
+# Quality metadata
+y$samples$rin <- as.factor(c(
+  colData(rse_brain_selected)$gtex.smrin,
+  colData(rse_blood_selected)$gtex.smrin,
+  colData(rse_muscle_selected)$gtex.smrin))
+
+y$samples$slice <- as.factor(c(
+  colData(rse_brain_selected)$gtex.smtsd,
+  colData(rse_blood_selected)$gtex.smtsd,
+  colData(rse_muscle_selected)$gtex.smtsd))
+
+y$samples$sex <- as.factor(c(
+  colData(rse_brain_selected)$gtex.sex,
+  colData(rse_blood_selected)$gtex.sex,
+  colData(rse_muscle_selected)$gtex.sex))
+
+y$samples$age <- as.factor(c(
+  colData(rse_brain_selected)$gtex.age,
+  colData(rse_blood_selected)$gtex.age,
+  colData(rse_muscle_selected)$gtex.age))
+
+y$samples$rRNA <- as.factor(c(
+  colData(rse_brain_selected)$gtex.smrrnart,
+  colData(rse_blood_selected)$gtex.smrrnart,
+  colData(rse_muscle_selected)$gtex.smrrnart))
+
+y$samples$mapped <- as.factor(c(
+  colData(rse_brain_selected)$"recount_qc.star.uniquely_mapped_reads_%_both",
+  colData(rse_blood_selected)$"recount_qc.star.uniquely_mapped_reads_%_both",
+  colData(rse_muscle_selected)$"recount_qc.star.uniquely_mapped_reads_%_both"))
+
+y$samples$chrm <- as.factor(c(
+  colData(rse_brain_selected)$"recount_qc.aligned_reads%.chrm",
+  colData(rse_blood_selected)$"recount_qc.aligned_reads%.chrm",
+  colData(rse_muscle_selected)$"recount_qc.aligned_reads%.chrm"))
+
+y
+```
+
+------------------------------------------------------------------------
+
+# 5 · Low-expression gene filtering
+
+Genes with very low or zero counts across all samples carry no
+statistical power and inflate the multiple-testing burden. Two
+complementary checks are applied:
+
+1. Genes with zero counts in **all 9 samples** are identified first as a
+   diagnostic step.
+2. `filterByExpr()` applies edgeR's recommended filtering strategy: a
+   gene is retained only if it achieves a minimum count (default ~10
+   reads) in at least as many samples as the smallest group size (here,
+   3). This threshold is automatically scaled by library size, making it
+   robust across datasets with different sequencing depths.
+
+Setting `keep.lib.sizes = FALSE` forces recalculation of library sizes
+after filtering, ensuring accurate normalization factors in the next
+step.
+
+```{r filtering}
+table(rowSums(y$counts == 0) == 9)
+
+keep.exprs <- filterByExpr(y, group = group)
+y          <- y[keep.exprs, , keep.lib.sizes = FALSE]
+dim(y)
+```
+
+------------------------------------------------------------------------
+
+# 6 · TMM normalization
+
+RNA-seq library sizes differ across samples due to technical variation in
+sequencing depth. Raw counts therefore cannot be directly compared.
+**TMM (Trimmed Mean of M-values)** normalization estimates a scaling
+factor for each sample by computing a weighted trimmed mean of log
+fold-changes relative to a reference sample, after excluding genes with
+extreme expression differences (trimming). These scaling factors are
+stored in `y$samples$norm.factors` and incorporated automatically into
+all downstream edgeR calculations.
+
+The boxplots before and after normalization allow a visual check that
+the distributions are well-aligned after scaling, as expected.
+
+```{r normalization}
+logcpm_before <- cpm(y, log = TRUE)
+y             <- normLibSizes(y, method = "TMM")
+logcpm_after  <- cpm(y, log = TRUE)
+y
+```
+
+## Log-CPM boxplots before and after normalization
+
+```{r norm-boxplot, fig.height=5}
+tissue_cols <- c(
+  rep("#2b7bba", 3),   # Brain
+  rep("#9a2b7b", 3),   # Blood
+  rep("#c68e17", 3)    # Muscle
+)
+
+boxplot(logcpm_before,
+        col    = tissue_cols,
+        notch  = FALSE,
+        las    = 2,
+        ylab   = "log CPM",
+        outpch = 16,
+        outcex = 0.6,
+        main   = "Log-CPM before TMM normalization")
+
+boxplot(logcpm_after,
+        col    = tissue_cols,
+        notch  = FALSE,
+        las    = 2,
+        ylab   = "log CPM",
+        outpch = 16,
+        outcex = 0.6,
+        main   = "Log-CPM after TMM normalization")
+```
+
+------------------------------------------------------------------------
+
+# 7 · Design matrix
+
+The design matrix encodes the experimental structure that the linear
+model will fit. The formula `~ 0 + group` specifies an **intercept-free
+model** where each tissue type gets its own coefficient directly
+(rather than one group being encoded as the intercept). This
+parameterization makes it straightforward to define arbitrary contrasts
+between groups (e.g., Brain − Blood) without algebraic manipulation.
+
+```{r design}
+design <- model.matrix(~ 0 + group, data = y$samples)
+colnames(design) <- levels(y$samples$group)
+design
+```
+
+------------------------------------------------------------------------
+
+# 8 · MDS plot – exploratory analysis of sample variability
+
+**Multi-Dimensional Scaling (MDS)** projects samples into a
+low-dimensional space such that distances approximate the log2
+fold-changes between pairs of samples for the top 500 most variable
+genes (by default). It provides an unsupervised, model-free look at the
+dominant sources of variance in the data before any formal testing.
+
+Six plots are produced, labelling samples by tissue group and five
+potential confounders in turn (rRNA fraction, mitochondrial read
+fraction, age, sex, tissue sub-region). If any confounder label
+correlates with the spatial separation of samples along a major axis, it
+should be considered as a covariate in the model.
+
+```{r mds, fig.height=5}
+logcpm <- cpm(y, log = TRUE)
+
+plotMDS(logcpm, col = tissue_cols, labels = group,
+        main = "MDS – Tissue")
+
+plotMDS(logcpm, col = tissue_cols, labels = y$samples$rRNA,
+        main = "MDS – rRNA fraction")
+
+plotMDS(logcpm, col = tissue_cols, labels = y$samples$chrm,
+        main = "MDS – % reads on chrM")
+
+plotMDS(logcpm, col = tissue_cols, labels = y$samples$age,
+        main = "MDS – Age")
+
+plotMDS(logcpm, col = tissue_cols, labels = y$samples$sex,
+        main = "MDS – Sex")
+
+plotMDS(logcpm, col = tissue_cols, labels = y$samples$slice,
+        main = "MDS – Tissue slice")
+```
+
+------------------------------------------------------------------------
+
+# 9 · Dispersion estimation
+
+edgeR models read counts with a **Negative Binomial (NB) distribution**,
+which has two parameters: the mean and the dispersion. The dispersion
+captures gene-to-gene variability in count data beyond what a Poisson
+model (variance = mean) would predict.
+
+`estimateDisp()` fits both a common dispersion (shared across all genes)
+and gene-wise dispersions, shrinking them toward a trended value via
+empirical Bayes. The **BCV (Biological Coefficient of Variation) plot**
+shows the square root of the dispersion estimates: the trend line
+summarizes how dispersion varies with expression level (highly expressed
+genes tend to have lower BCV), and the gene-wise estimates scatter around
+it.
+
+```{r dispersion}
+y <- estimateDisp(y, design)
+plotBCV(y)
+```
+
+------------------------------------------------------------------------
+
+# 10 · Differential expression – GLM QL F-test
+
+A **Quasi-Likelihood (QL) Negative Binomial GLM** is fitted to the data.
+Compared to the standard likelihood ratio test, the QL framework provides
+a more robust control of type I error, particularly with small sample
+sizes, by using a gene-level quasi-dispersion estimate that is itself
+moderated across genes with empirical Bayes.
+
+Three pairwise contrasts are tested:
+
+| Contrast | Interpretation |
+|---|---|
+| `(-1, 1, 0)` | Brain vs Blood (positive logFC = higher in Blood) |
+| `(-1, 0, 1)` | Muscle vs Blood (positive logFC = higher in Muscle) |
+| `(0, -1, 1)` | Muscle vs Brain (positive logFC = higher in Muscle) |
+
+The coefficient order follows the alphabetical ordering of the group
+factor levels: **Blood, Brain, Muscle**.
+
+```{r glm-fit}
+fit <- glmQLFit(y, design)
+
+# Brain vs Blood
+qlfBLB <- glmQLFTest(fit, contrast = c(-1,  1,  0))
+# Muscle vs Blood
+qlfMB  <- glmQLFTest(fit, contrast = c(-1,  0,  1))
+# Muscle vs Brain
+qlfMBL <- glmQLFTest(fit, contrast = c( 0, -1,  1))
+```
+
+## Top 10 differentially expressed genes per contrast
+
+Results are ranked by p-value and FDR-corrected with the
+Benjamini–Hochberg (BH) method, which controls the false discovery rate.
+
+```{r top-genes}
+topTags(qlfBLB, n = 10, adjust.method = "BH", sort.by = "PValue")
+topTags(qlfMB,  n = 10, adjust.method = "BH", sort.by = "PValue")
+topTags(qlfMBL, n = 10, adjust.method = "BH", sort.by = "PValue")
+```
+
+## Saving full results tables
+
+```{r save-results}
+resultsBLB <- topTags(qlfBLB, n = Inf, adjust.method = "BH",
+                      sort.by = "PValue", p.value = 1)
+resultsMB  <- topTags(qlfMB,  n = Inf, adjust.method = "BH",
+                      sort.by = "PValue", p.value = 1)
+resultsMBL <- topTags(qlfMBL, n = Inf, adjust.method = "BH",
+                      sort.by = "PValue", p.value = 1)
+
+write.table(resultsBLB, "results_Brain_vs_Blood.txt")
+write.table(resultsMB,  "results_Muscle_vs_Blood.txt")
+write.table(resultsMBL, "results_Muscle_vs_Brain.txt")
+```
+
+## DE gene counts at different cut-offs
+
+`decideTests()` classifies each gene as up-regulated, down-regulated, or
+not significant under a given FDR threshold and log-fold-change (lfc)
+cutoff. Comparing results across multiple thresholds (`p = 0.05 / 0.01`,
+`lfc = 0 / 1`) illustrates the sensitivity-specificity trade-off and
+helps choose a biologically meaningful stringency for downstream analyses.
+
+```{r summary-cutoffs}
+cat("--- Brain vs Blood ---\n")
+summary(decideTests(qlfBLB, p.value = 0.05, adjust.method = "BH", lfc = 0))
+summary(decideTests(qlfBLB, p.value = 0.05, adjust.method = "BH", lfc = 1))
+summary(decideTests(qlfBLB, p.value = 0.01, adjust.method = "BH", lfc = 0))
+summary(decideTests(qlfBLB, p.value = 0.01, adjust.method = "BH", lfc = 1))
+
+cat("\n--- Muscle vs Blood ---\n")
+summary(decideTests(qlfMB, p.value = 0.05, adjust.method = "BH", lfc = 0))
+summary(decideTests(qlfMB, p.value = 0.05, adjust.method = "BH", lfc = 1))
+summary(decideTests(qlfMB, p.value = 0.01, adjust.method = "BH", lfc = 0))
+summary(decideTests(qlfMB, p.value = 0.01, adjust.method = "BH", lfc = 1))
+
+cat("\n--- Muscle vs Brain ---\n")
+summary(decideTests(qlfMBL, p.value = 0.05, adjust.method = "BH", lfc = 0))
+summary(decideTests(qlfMBL, p.value = 0.05, adjust.method = "BH", lfc = 1))
+summary(decideTests(qlfMBL, p.value = 0.01, adjust.method = "BH", lfc = 0))
+summary(decideTests(qlfMBL, p.value = 0.01, adjust.method = "BH", lfc = 1))
+```
+
+------------------------------------------------------------------------
+
+# 11 · Tissue-specific genes
+
+A gene is defined as **tissue-specific** if it is significantly
+up-regulated in that tissue relative to *both* other tissues (FDR < 0.01,
+logFC > 0). This conservative definition — requiring simultaneous
+significance in two independent comparisons — reduces false positives that
+would arise from testing only one pair.
+
+The approach uses set intersection: a gene must appear in the up-regulated
+set of *both* pairwise contrasts involving the tissue of interest.
+
+## Brain-specific
+
+```{r tissue-brain}
+qlf_BvsBlood  <- glmQLFTest(fit, contrast = c(-1,  1,  0))
+qlf_BvsMuscle <- glmQLFTest(fit, contrast = c( 0,  1, -1))
+
+results_BvsBlood  <- topTags(qlf_BvsBlood,  n = Inf)$table
+results_BvsMuscle <- topTags(qlf_BvsMuscle, n = Inf)$table
+
+up_BvsBlood  <- rownames(results_BvsBlood[ results_BvsBlood$FDR  < 0.01 & results_BvsBlood$logFC  > 0, ])
+up_BvsMuscle <- rownames(results_BvsMuscle[results_BvsMuscle$FDR < 0.01 & results_BvsMuscle$logFC > 0, ])
+
+brain_specific <- intersect(up_BvsBlood, up_BvsMuscle)
+```
+
+## Blood-specific
+
+```{r tissue-blood}
+qlf_BloodvsBrain  <- glmQLFTest(fit, contrast = c( 1, -1,  0))
+qlf_BloodvsMuscle <- glmQLFTest(fit, contrast = c( 1,  0, -1))
+
+results_BloodvsBrain  <- topTags(qlf_BloodvsBrain,  n = Inf)$table
+results_BloodvsMuscle <- topTags(qlf_BloodvsMuscle, n = Inf)$table
+
+up_BloodvsBrain  <- rownames(results_BloodvsBrain[ results_BloodvsBrain$FDR  < 0.01 & results_BloodvsBrain$logFC  > 0, ])
+up_BloodvsMuscle <- rownames(results_BloodvsMuscle[results_BloodvsMuscle$FDR < 0.01 & results_BloodvsMuscle$logFC > 0, ])
+
+blood_specific <- intersect(up_BloodvsBrain, up_BloodvsMuscle)
+```
+
+## Muscle-specific
+
+```{r tissue-muscle}
+qlf_MusclevsBrain <- glmQLFTest(fit, contrast = c( 0, -1,  1))
+qlf_MusclevsBlood <- glmQLFTest(fit, contrast = c(-1,  0,  1))
+
+results_MusclevsBrain <- topTags(qlf_MusclevsBrain, n = Inf)$table
+results_MusclevsBlood <- topTags(qlf_MusclevsBlood, n = Inf)$table
+
+up_MusclevsBrain <- rownames(results_MusclevsBrain[results_MusclevsBrain$FDR < 0.01 & results_MusclevsBrain$logFC > 0, ])
+up_MusclevsBlood <- rownames(results_MusclevsBlood[results_MusclevsBlood$FDR < 0.01 & results_MusclevsBlood$logFC > 0, ])
+
+muscle_specific <- intersect(up_MusclevsBrain, up_MusclevsBlood)
+```
+
+## Summary and export
+
+```{r tissue-summary}
+print(paste("Tissue-specific genes – Brain:",  length(brain_specific)))
+print(paste("Tissue-specific genes – Blood:",  length(blood_specific)))
+print(paste("Tissue-specific genes – Muscle:", length(muscle_specific)))
+
+head(brain_specific,  10)
+head(blood_specific,  10)
+head(muscle_specific, 10)
+
+write.table(brain_specific,  "brain_specific_genes.txt")
+write.table(blood_specific,  "blood_specific_genes.txt")
+write.table(muscle_specific, "muscle_specific_genes.txt")
+```
+
+------------------------------------------------------------------------
+
+# 12 · Validation with TPM
+
+To validate the tissue-specificity calls, expression of a representative
+gene from each tissue-specific list is visualized directly in **TPM
+(Transcripts Per Million)** across all samples of all three tissues —
+using the **full RSE objects** (not just the 9 selected samples). TPM
+normalizes for gene length and sequencing depth, making values more
+interpretable for cross-sample comparisons than raw counts.
+
+A **Wilcoxon rank-sum test** is used for pairwise comparison because it
+makes no distributional assumption about the data, which is appropriate
+given the small sample sizes and the non-normality typical of RNA-seq
+count data. A significant result (p < 0.05) in both tests confirms that
+the gene identified as Brain-specific is indeed expressed at consistently
+higher levels in brain relative to both blood and muscle.
+
+```{r tpm-validation, fig.height=5}
+assays(rse_brain)$TPM  <- recount::getTPM(rse_brain)
+assays(rse_blood)$TPM  <- recount::getTPM(rse_blood)
+assays(rse_muscle)$TPM <- recount::getTPM(rse_muscle)
+
+idx <- which(rowData(rse_brain)$gene_name == brain_specific[1])
+
+boxplot(
+  assays(rse_brain)$TPM[idx, ],
+  assays(rse_blood)$TPM[idx, ],
+  assays(rse_muscle)$TPM[idx, ],
+  outline = FALSE,
+  names   = c("Brain", "Blood", "Muscle"),
+  main    = paste("Expression of", brain_specific[1], "(TPM)"),
+  ylab    = "Transcripts Per Million (TPM)",
+  col     = c("royalblue", "firebrick", "forestgreen")
+)
+
+wilcox.test(assays(rse_brain)$TPM[idx, ], assays(rse_blood)$TPM[idx, ])
+wilcox.test(assays(rse_brain)$TPM[idx, ], assays(rse_muscle)$TPM[idx, ])
+```
+
+## Tissue-specific gene counts – barplot
+
+```{r tissue-barplot, fig.height=5}
+tissue_counts <- c(
+  Brain       = length(brain_specific),
+  Muscle      = length(muscle_specific),
+  BloodVessel = length(blood_specific)
+)
+tissue_counts <- sort(tissue_counts, decreasing = TRUE)
+
+col_map    <- c(Brain = "#2b7bba", BloodVessel = "#9a2b7b", Muscle = "#c68e17")
+bar_colors <- col_map[names(tissue_counts)]
+
+bp <- barplot(tissue_counts,
+              col  = bar_colors,
+              main = "Tissue-Specific Transcriptional Signatures",
+              ylab = "Number of Up-regulated Genes",
+              ylim = c(0, max(tissue_counts) * 1.15))
+
+text(x = bp, y = tissue_counts, labels = tissue_counts, pos = 3, cex = 1)
+```
+
+------------------------------------------------------------------------
+
+# 13 · Gene list preparation for Enrichr
+
+Tissue-specific gene lists are pre-processed before functional
+enrichment analysis on **Enrichr** (https://maayanlab.cloud/Enrichr/).
+Two filtering steps are applied:
+
+1. **Removal of low-information gene symbols**: pseudogenes (`LOC`),
+   long intergenic non-coding RNAs (`LINC`), microRNAs (`MIR`), small
+   nucleolar RNAs (`SNORD`), and ribosomal protein genes (`RPL`, `RPS`)
+   are excluded. These either lack functional annotation in pathway
+   databases or are too constitutively expressed to be informative as
+   tissue markers.
+2. **Size cap at 1,500 genes**: Enrichr's statistical tests become less
+   powerful with very large input lists. The top genes by FDR are
+   therefore retained up to a maximum of 1,500.
+
+```{r enrichr-prep}
+# Remove poorly informative gene symbols
+rm_pattern <- "^LOC|^LINC|^MIR|^SNORD|^RPL|^RPS"
+
+brain_specific_clean  <- brain_specific[ !grepl(rm_pattern, brain_specific)]
+muscle_specific_clean <- muscle_specific[!grepl(rm_pattern, muscle_specific)]
+blood_specific_clean  <- blood_specific[ !grepl(rm_pattern, blood_specific)]
+
+# Sort by FDR and cap at 1500
+ord  <- order(results_BvsBlood[ brain_specific_clean,  "FDR"])
+brain_specific_top  <- brain_specific_clean[ord][1:min(1500, length(brain_specific_clean))]
+
+ord2 <- order(results_MusclevsBrain[muscle_specific_clean, "FDR"])
+muscle_specific_top <- muscle_specific_clean[ord2][1:min(1500, length(muscle_specific_clean))]
+
+writeLines(brain_specific_top,  "brain_for_enrichr.txt")
+writeLines(muscle_specific_top, "muscle_for_enrichr.txt")
+writeLines(blood_specific_clean,"blood_for_enrichr.txt")
+
+cat("Brain genes for Enrichr:",  length(brain_specific_top),  "\n")
+cat("Muscle genes for Enrichr:", length(muscle_specific_top), "\n")
+cat("Blood genes for Enrichr:",  length(blood_specific_clean),"\n")
+```
+
+------------------------------------------------------------------------
+
+*Analysis completed – `r Sys.time()`*
